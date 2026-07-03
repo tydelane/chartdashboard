@@ -1,0 +1,1025 @@
+# -*- coding: utf-8 -*-
+"""
+MON- Plant Metrics Dashboard
+============================
+
+Ignition Project Library module for the Web Dev resource.
+
+Deployment:
+1. Create this module in Project > Scripting > Project Library as:
+       PlantMetricsDashboard
+2. Create one Web Dev Python Resource named "app".
+3. Put the supplied app_doGet.py body in doGet and app_doPost.py body in doPost.
+4. Create the local ECharts File Resource at ECHARTS_ASSET_PATH.
+5. Run the supplied SQL Server DDL.
+6. Configure Web Dev security on BOTH doGet and doPost:
+   Require Authentication, your existing User Source/roles, and Require HTTPS
+   for production.
+
+This code intentionally has no custom login page, no custom passwords, and no
+custom role system. Ignition Web Dev resource security controls access. The
+session user is read only to identify dashboard ownership in SQL.
+
+This module never writes, configures, deletes, copies, or renames process tags.
+All process tag operations are read-only browse/read/history queries.
+"""
+
+import json
+import re
+from java.util import Date, UUID
+
+# ============================================================================
+# DEPLOYMENT CONSTANTS - EDIT THESE FIRST
+# ============================================================================
+
+# Application identity displayed in the browser and returned by bootstrap.
+APP_TITLE = "MON- Plant Metrics Dashboard"
+APP_VERSION = "1.0.0"
+CONFIG_SCHEMA_VERSION = 1
+
+# --- Web Dev resource paths -------------------------------------------------
+# Copy the exact mounted path from the Web Dev resource in Designer. The HTML
+# posts all API requests back to the same Python resource listed below.
+APP_MOUNT_PATH = "/system/webdev/YOUR_PROJECT/PlantMetricsDashboard/app"
+API_POST_PATH = APP_MOUNT_PATH
+
+# Copy the mounted path of the local ECharts File Resource. Keep this local:
+# no CDN fallback is used by the application.
+ECHARTS_ASSET_PATH = "/system/webdev/YOUR_PROJECT/PlantMetricsDashboard/assets/echarts.min.js"
+
+# --- Database ---------------------------------------------------------------
+# Set this to the exact Ignition database connection name, not a SQL server
+# hostname. The connection must point to the SQL Server database containing the
+# table created by PlantMetricsDashboard_SQLServer2008R2.sql.
+DATABASE_CONNECTION_NAME = "YOUR_DATABASE_CONNECTION"
+DATABASE_SCHEMA_NAME = "dbo"
+DASHBOARD_TABLE_NAME = "PlantMetricsDashboard"
+
+# --- Built-in Ignition Web Dev security ------------------------------------
+# Configure Require Authentication, user source, roles, and HTTPS in the Web
+# Dev resource settings in Designer. There are deliberately NO custom roles,
+# passwords, browser identity fields, or login endpoints in this code.
+#
+# The session user is used only for SQL ownership. Do not place role names here.
+
+# --- Tag browsing / historian scope ----------------------------------------
+# Only these configured roots can be browsed or queried. Every browse, current
+# read, historian request, and as-of request is checked against this list.
+# Each root must include the provider in Ignition tag-path syntax.
+ALLOWED_TAG_ROOTS = [
+    {
+        "provider": "default",
+        "root": "[default]Production",
+        "label": "Production"
+    }
+]
+
+# When True, atomic tags without history enabled are omitted from the picker.
+# This may increase browse time because each atomic tag is checked. Leave False
+# if your tag history inheritance/configuration makes that property ambiguous.
+REQUIRE_HISTORY_ENABLED_TAGS = False
+TAG_BROWSER_MAX_RESULTS = 200
+TAG_BROWSER_MAX_DEPTH = 32
+
+# --- Dashboard and layout limits -------------------------------------------
+MAX_DASHBOARDS_PER_OWNER = 10
+MAX_WIDGETS_PER_DASHBOARD = 24
+GRID_COLUMNS = 24
+GRID_ROWS = 16
+
+# Per-widget tag source caps. Trend tags are pens. Table tags are rows. Events
+# tags are transition sources. All other initial widgets use one tag.
+MAX_TAGS_BY_WIDGET = {
+    "trend": 12,
+    "table": 12,
+    "events": 12,
+    "value": 1,
+    "status": 1,
+    "timeline": 1,
+    "stat": 1,
+    "statebreakdown": 1
+}
+MAX_AXES_PER_TREND = 8
+
+# --- Request / historian limits --------------------------------------------
+# A query can cover at most this many 30-day months. The browser also enforces
+# it for usability, but this server limit is authoritative.
+MAX_QUERY_MONTHS = 6
+MAX_QUERY_DURATION_MS = MAX_QUERY_MONTHS * 30 * 24 * 60 * 60 * 1000
+
+# Maximum distinct history series in one POST. A series is a tag path plus its
+# selected aggregation. Keep this at or below the total possible widget source
+# count you expect to support.
+MAX_HISTORY_SERIES_PER_REQUEST = 48
+MAX_CURRENT_TAGS_PER_REQUEST = 48
+
+# Raw stored historian retrieval is default. To protect browser payload size,
+# this is the maximum number of returned rows per tag/series. The server
+# returns a clear error asking for a shorter range rather than silently
+# interpolating or inventing points.
+MAX_HISTORY_POINTS_PER_TAG = 5000
+
+# As-of lookback used by zoomed/historical reference widgets. A value is the
+# latest stored historian sample at or before the red reference time, looking
+# back this many days. Raise this for slow-changing tags.
+AS_OF_LOOKBACK_DAYS = 30
+# --- Opening live range -----------------------------------------------------
+# Each dashboard saves its own openingLiveRange in ConfigJson. These defaults
+# apply to new dashboards and legacy rows without that configuration.
+DEFAULT_OPENING_LIVE_AMOUNT = 8
+DEFAULT_OPENING_LIVE_UNIT = "Hours"
+DEFAULT_OPENING_AUTO_REFRESH = True
+DEFAULT_OPENING_POLL_SECONDS = 10
+
+# --- UI / input limits ------------------------------------------------------
+MAX_DASHBOARD_NAME_LENGTH = 160
+MAX_DASHBOARD_DESCRIPTION_LENGTH = 1000
+MAX_WIDGET_TITLE_LENGTH = 160
+MAX_JSON_REQUEST_BYTES = 1024 * 1024
+MAX_TAG_LABEL_LENGTH = 160
+
+# --- Optional behavior ------------------------------------------------------
+# False means the user who owns the dashboard is the only person allowed to
+# save/delete it. Shared dashboards are view/copy only for nonowners.
+ALLOW_ADMIN_EDIT_ANY_DASHBOARD = False
+
+# ============================================================================
+# INTERNAL CONSTANTS - DO NOT NEED DEPLOYMENT EDITS
+# ============================================================================
+
+LOGGER_NAME = "MON.PlantMetricsDashboard"
+ALLOWED_WIDGET_TYPES = set([
+    "trend", "value", "status", "timeline", "table", "stat",
+    "statebreakdown", "events"
+])
+ALLOWED_AGGREGATES = set([
+    "Raw stored values", "Average", "Min/Max", "Last Value"
+])
+ALLOWED_RENDER_MODES = set(["Analog", "Digital", "State"])
+ALLOWED_LINE_TYPES = set(["Solid", "Dashed", "Dotted"])
+ALLOWED_INTERPOLATIONS = set(["Inherit", "Linear", "Smooth"])
+ALLOWED_RANGE_UNITS = set(["Seconds", "Minutes", "Hours", "Days", "Weeks", "Months"])
+ALLOWED_DATA_FORMATS = set([
+    "Auto", "Decimal", "Whole number",
+    "Boolean (Off / On)", "State (0–3 labels)"
+])
+ALLOWED_STAT_METRICS = set([
+    "Average", "Minimum", "Maximum", "Sum", "Change", "Range",
+    "Duration On", "Duration Off", "Percent On", "Transition Count",
+    "Duration in State", "Percent in State", "State Change Count"
+])
+
+# ============================================================================
+# BASIC HELPERS
+# ============================================================================
+
+class DashboardError(Exception):
+    pass
+
+def _logger():
+    return system.util.getLogger(LOGGER_NAME)
+
+def _text(value):
+    if value is None:
+        return ""
+    try:
+        return unicode(value)
+    except:
+        return str(value)
+
+def _safe_text(value, limit, field_name, allow_empty=True):
+    value = _text(value).strip()
+    if not allow_empty and not value:
+        raise DashboardError("%s is required." % field_name)
+    if len(value) > limit:
+        raise DashboardError("%s is too long." % field_name)
+    if u"\x00" in value:
+        raise DashboardError("%s contains an invalid character." % field_name)
+    return value
+
+def _as_int(value, default_value=0):
+    try:
+        return int(value)
+    except:
+        return default_value
+
+def _as_float(value, default_value=0.0):
+    try:
+        return float(value)
+    except:
+        return default_value
+
+def _as_bool(value):
+    return value is True or _text(value).lower() in ("1", "true", "yes", "on")
+
+def _java_date(epoch_ms):
+    return Date(long(epoch_ms))
+
+def _epoch_ms(value):
+    if value is None:
+        return None
+    try:
+        return long(value.getTime())
+    except:
+        try:
+            return long(value)
+        except:
+            return None
+
+def _json_load(value, field_name):
+    if isinstance(value, basestring):
+        try:
+            return json.loads(value)
+        except Exception as exc:
+            raise DashboardError("%s is not valid JSON." % field_name)
+    return value
+
+def _to_plain(value):
+    """Converts Java/Py objects into JSON-friendly Python values."""
+    if value is None:
+        return None
+    if isinstance(value, (basestring, int, long, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return dict([(k, _to_plain(v)) for k, v in value.items()])
+    try:
+        # Java Map / list-like objects are normalized through Ignition JSON.
+        return json.loads(system.util.jsonEncode(value))
+    except:
+        return _text(value)
+
+def _require_dict(value, field_name):
+    value = _to_plain(value)
+    if not isinstance(value, dict):
+        raise DashboardError("%s must be an object." % field_name)
+    return value
+
+def _require_list(value, field_name):
+    value = _to_plain(value)
+    if not isinstance(value, list):
+        raise DashboardError("%s must be a list." % field_name)
+    return value
+
+def _valid_identifier(name, field_name):
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or ""):
+        raise DashboardError("%s must contain only letters, digits, and underscores." % field_name)
+    return name
+
+def _qualified_table():
+    schema = _valid_identifier(DATABASE_SCHEMA_NAME, "DATABASE_SCHEMA_NAME")
+    table = _valid_identifier(DASHBOARD_TABLE_NAME, "DASHBOARD_TABLE_NAME")
+    return "[%s].[%s]" % (schema, table)
+def _row_value(row, name, default=None):
+    try:
+        return row[name]
+    except:
+        try:
+            return row.get(name, default)
+        except:
+            return default
+
+# ============================================================================
+# BUILT-IN IGNITION SESSION IDENTITY
+# ============================================================================
+
+def _user_property(user, method_names, attribute_names):
+    for method_name in method_names:
+        try:
+            method = getattr(user, method_name)
+            value = method()
+            if value is not None and _text(value):
+                return _text(value)
+        except:
+            pass
+    for attribute_name in attribute_names:
+        try:
+            value = getattr(user, attribute_name)
+            if value is not None and _text(value):
+                return _text(value)
+        except:
+            pass
+        try:
+            value = user[attribute_name]
+            if value is not None and _text(value):
+                return _text(value)
+        except:
+            pass
+    return ""
+
+def _session_identity(session):
+    # Web Dev resource Require Authentication is the access control. This only
+    # reads the authenticated user object placed in the built-in session.
+    try:
+        user = session.get("user")
+    except:
+        try:
+            user = session["user"]
+        except:
+            user = None
+    if user is None:
+        raise DashboardError("This Web Dev resource requires an authenticated Ignition session.")
+
+    username = _user_property(
+        user,
+        ["getUsername", "getUserName", "getName"],
+        ["username", "userName", "name"]
+    )
+    display_name = _user_property(
+        user,
+        ["getDisplayName", "getFullName", "getName"],
+        ["displayName", "fullName", "name"]
+    )
+    if not username:
+        raise DashboardError("Ignition did not provide an authenticated username for this session.")
+    if not display_name:
+        display_name = username
+    return {
+        "username": username,
+        "displayName": display_name
+    }
+
+# ============================================================================
+# DATABASE HELPERS
+# ============================================================================
+
+def _query_rows(query, args):
+    dataset = system.db.runPrepQuery(query, args, DATABASE_CONNECTION_NAME)
+    headers = list(system.dataset.getColumnHeaders(dataset))
+    rows = []
+    for row_index in range(dataset.getRowCount()):
+        row = {}
+        for column_index in range(len(headers)):
+            row[headers[column_index]] = dataset.getValueAt(row_index, column_index)
+        rows.append(row)
+    return rows
+def _query_one(query, args):
+    rows = _query_rows(query, args)
+    return rows[0] if rows else None
+
+def _run_update(query, args):
+    return system.db.runPrepUpdate(query, args, DATABASE_CONNECTION_NAME)
+
+def _dashboard_select_sql(extra_where):
+    return """
+        SELECT
+            DashboardId,
+            OwnerUsername,
+            OwnerDisplayName,
+            DashboardName,
+            DashboardDescription,
+            IsShared,
+            ConfigSchemaVersion,
+            ConfigJson,
+            CONVERT(varchar(34), RowVersion, 1) AS RowVersionHex,
+            CreatedAt,
+            UpdatedAt
+        FROM %s
+        %s
+    """ % (_qualified_table(), extra_where)
+
+def _decode_dashboard_row(row):
+    try:
+        config = json.loads(_text(_row_value(row, "ConfigJson", "{}")))
+    except:
+        raise DashboardError("A saved dashboard contains invalid ConfigJson.")
+
+    config = _validate_dashboard_config(config, allow_empty_widgets=False)
+    return {
+        "id": _text(_row_value(row, "DashboardId")),
+        "ownerUsername": _text(_row_value(row, "OwnerUsername")),
+        "ownerDisplayName": _text(_row_value(row, "OwnerDisplayName")),
+        "name": _text(_row_value(row, "DashboardName")),
+        "description": _text(_row_value(row, "DashboardDescription")),
+        "isShared": _as_bool(_row_value(row, "IsShared")),
+        "savedIsShared": _as_bool(_row_value(row, "IsShared")),
+        "configSchemaVersion": _as_int(_row_value(row, "ConfigSchemaVersion"), CONFIG_SCHEMA_VERSION),
+        "rowVersion": _text(_row_value(row, "RowVersionHex")),
+        "rows": config["rows"],
+        "cols": config["cols"],
+        "openingLiveRange": config["openingLiveRange"],
+        "widgets": config["widgets"]
+    }
+
+def _fetch_dashboard_by_id(dashboard_id):
+    row = _query_one(
+        _dashboard_select_sql("WHERE DashboardId = ?"),
+        [dashboard_id]
+    )
+    return _decode_dashboard_row(row) if row else None
+
+def _fetch_owned_dashboard(dashboard_id, username):
+    row = _query_one(
+        _dashboard_select_sql("WHERE DashboardId = ? AND OwnerUsername = ?"),
+        [dashboard_id, username]
+    )
+    return _decode_dashboard_row(row) if row else None
+
+def _dashboard_count(username):
+    row = _query_one(
+        "SELECT COUNT(*) AS DashboardCount FROM %s WHERE OwnerUsername = ?" % _qualified_table(),
+        [username]
+    )
+    return _as_int(_row_value(row, "DashboardCount"), 0)
+
+def _unique_dashboard_name(username, requested_name):
+    base = _safe_text(requested_name, MAX_DASHBOARD_NAME_LENGTH, "Dashboard name", False)
+    candidate = base
+    suffix = 2
+    while _query_one(
+        "SELECT DashboardId FROM %s WHERE OwnerUsername = ? AND DashboardName = ?" % _qualified_table(),
+        [username, candidate]
+    ):
+        tail = " (%s)" % suffix
+        candidate = base[:MAX_DASHBOARD_NAME_LENGTH - len(tail)] + tail
+        suffix += 1
+    return candidate
+
+# ============================================================================
+# CONFIGURATION / JSON VALIDATION
+# ============================================================================
+
+def _default_axis():
+    return {
+        "id": "axis-primary",
+        "label": "Primary",
+        "name": "Primary",
+        "type": "Analog",
+        "dataFormat": "Auto",
+        "side": "Left",
+        "offset": 0,
+        "width": 64,
+        "min": "Auto",
+        "max": "Auto",
+        "units": "",
+        "precision": 1,
+        "color": "#75b7ff",
+        "visible": True
+    }
+
+def _default_trend_config():
+    return {
+        "axes": [_default_axis()],
+        "tags": [],
+        "style": {
+            "showLegend": True,
+            "showGrid": True,
+            "background": "Default dark",
+            "interpolation": "Linear",
+            "referenceLineStyle": "Solid"
+        },
+        "timeScope": "Dashboard"
+    }
+
+def _default_dashboard_config():
+    return {
+        "rows": GRID_ROWS,
+        "cols": GRID_COLUMNS,
+        "openingLiveRange": {
+            "amount": DEFAULT_OPENING_LIVE_AMOUNT,
+            "unit": DEFAULT_OPENING_LIVE_UNIT
+        },
+        "widgets": [{
+            "id": "trend-main",
+            "type": "trend",
+            "title": "Trend Chart",
+            "x": 0,
+            "y": 0,
+            "w": GRID_COLUMNS,
+            "h": GRID_ROWS,
+            "showHeader": True,
+            "contentScale": 5,
+            "config": _default_trend_config()
+        }]
+    }
+
+def _validate_range_unit(unit):
+    unit = _text(unit)
+    if unit not in ALLOWED_RANGE_UNITS:
+        raise DashboardError("Opening duration unit is not supported.")
+    return unit
+
+def _unit_milliseconds(unit):
+    return {
+        "Seconds": 1000,
+        "Minutes": 60000,
+        "Hours": 3600000,
+        "Days": 86400000,
+        "Weeks": 604800000,
+        "Months": 30 * 24 * 60 * 60 * 1000
+    }[unit]
+
+def _validate_opening_range(value):
+    value = _require_dict(value or {}, "openingLiveRange")
+    unit = _validate_range_unit(value.get("unit", DEFAULT_OPENING_LIVE_UNIT))
+    amount = _as_int(value.get("amount", DEFAULT_OPENING_LIVE_AMOUNT), DEFAULT_OPENING_LIVE_AMOUNT)
+    if amount < 1:
+        raise DashboardError("Opening duration must be at least one unit.")
+    max_amount = int(MAX_QUERY_DURATION_MS / _unit_milliseconds(unit))
+    if amount > max_amount:
+        raise DashboardError("Opening duration cannot exceed %s months." % MAX_QUERY_MONTHS)
+    return {"amount": amount, "unit": unit}
+
+def _validate_tag_path(path, allow_empty=True):
+    path = _safe_text(path, 1024, "Tag path", allow_empty)
+    if not path:
+        return ""
+    for root_info in ALLOWED_TAG_ROOTS:
+        root = _safe_text(root_info.get("root"), 1024, "ALLOWED_TAG_ROOTS root", False).rstrip("/")
+        if path == root or path.startswith(root + "/"):
+            return path
+    raise DashboardError("Tag path is outside the configured approved roots.")
+
+def _normalize_tag(tag):
+    tag = _require_dict(tag or {}, "Tag")
+    path = _validate_tag_path(tag.get("path", ""), True)
+    mode = _text(tag.get("mode", "Analog"))
+    if mode not in ALLOWED_RENDER_MODES:
+        raise DashboardError("Tag render mode is not supported.")
+    aggregate = _text(tag.get("aggregate", "Raw stored values"))
+    if aggregate not in ALLOWED_AGGREGATES:
+        raise DashboardError("Tag historian retrieval is not supported.")
+    if mode != "Analog":
+        aggregate = "Raw stored values"
+    line_type = _text(tag.get("lineType", "Solid"))
+    if line_type not in ALLOWED_LINE_TYPES:
+        line_type = "Solid"
+    interpolation = _text(tag.get("interpolation", "Inherit"))
+    if interpolation not in ALLOWED_INTERPOLATIONS:
+        interpolation = "Inherit"
+    axis = _safe_text(tag.get("axis", "axis-primary"), 120, "Tag axis", True)
+    return {
+        "id": _safe_text(tag.get("id", str(UUID.randomUUID())), 120, "Tag id", False),
+        "name": _safe_text(tag.get("name", "Select a historian tag"), MAX_TAG_LABEL_LENGTH, "Tag label", True),
+        "path": path,
+        "type": _safe_text(tag.get("type", "Float"), 80, "Tag data type", True),
+        "source": path,
+        "axis": axis,
+        "color": _safe_text(tag.get("color", "#75b7ff"), 32, "Tag color", True),
+        "width": max(1, min(4, _as_int(tag.get("width", 2), 2))),
+        "mode": mode,
+        "lineType": line_type,
+        "visible": _as_bool(tag.get("visible", True)),
+        "aggregate": aggregate,
+        "interpolation": interpolation,
+        "breakOnMissingData": _as_bool(tag.get("breakOnMissingData", True))
+    }
+
+def _normal_range(value):
+    text = _text(value).strip()
+    if not text or text.lower() == "auto":
+        return "Auto"
+    number = _as_float(text, None)
+    if number is None:
+        raise DashboardError("Axis range must be Auto or a number.")
+    return str(number)
+
+def _normalize_axis(axis, existing_ids):
+    axis = _require_dict(axis or {}, "Axis")
+    axis_id = _safe_text(axis.get("id", str(UUID.randomUUID())), 120, "Axis id", False)
+    if axis_id in existing_ids:
+        raise DashboardError("Trend axis ids must be unique.")
+    existing_ids.add(axis_id)
+    side = _text(axis.get("side", "Left"))
+    if side not in ("Left", "Right"):
+        raise DashboardError("Axis position must be Left or Right.")
+    data_format = _text(axis.get("dataFormat", "Auto"))
+    if data_format not in ALLOWED_DATA_FORMATS:
+        raise DashboardError("Axis data format is not supported.")
+    minimum = _normal_range(axis.get("min", "Auto"))
+    maximum = _normal_range(axis.get("max", "Auto"))
+    if minimum != "Auto" and maximum != "Auto" and _as_float(minimum) >= _as_float(maximum):
+        raise DashboardError("Axis minimum must be lower than axis maximum.")
+    label = _safe_text(axis.get("label", axis.get("name", "Axis")), 160, "Axis label", False)
+    return {
+        "id": axis_id,
+        "label": label,
+        "name": label,
+        "type": _safe_text(axis.get("type", "Analog"), 80, "Axis type", True),
+        "dataFormat": data_format,
+        "side": side,
+        "offset": max(0, _as_int(axis.get("offset", 0), 0)),
+        "width": max(26, min(260, _as_int(axis.get("width", 58), 58))),
+        "min": minimum,
+        "max": maximum,
+        "units": _safe_text(axis.get("units", ""), 40, "Axis units", True),
+        "precision": max(0, min(5, _as_int(axis.get("precision", 1), 1))),
+        "color": _safe_text(axis.get("color", "#75b7ff"), 32, "Axis color", True),
+        "visible": _as_bool(axis.get("visible", True))
+    }
+
+def _normalize_widget(widget):
+    widget = _require_dict(widget, "Widget")
+    widget_type = _text(widget.get("type"))
+    if widget_type not in ALLOWED_WIDGET_TYPES:
+        raise DashboardError("Unsupported widget type.")
+    x = _as_int(widget.get("x"), -1)
+    y = _as_int(widget.get("y"), -1)
+    width = _as_int(widget.get("w"), 0)
+    height = _as_int(widget.get("h"), 0)
+    if x < 0 or y < 0 or width < 1 or height < 1 or x + width > GRID_COLUMNS or y + height > GRID_ROWS:
+        raise DashboardError("A widget is outside the %s x %s dashboard grid." % (GRID_COLUMNS, GRID_ROWS))
+
+    config = _require_dict(widget.get("config", {}), "Widget config")
+    normalized = {
+        "id": _safe_text(widget.get("id", str(UUID.randomUUID())), 120, "Widget id", False),
+        "type": widget_type,
+        "title": _safe_text(widget.get("title", widget_type), MAX_WIDGET_TITLE_LENGTH, "Widget title", False),
+        "x": x, "y": y, "w": width, "h": height,
+        "showHeader": _as_bool(widget.get("showHeader", True)),
+        "contentScale": max(1, min(10, _as_int(widget.get("contentScale", 5), 5))),
+        "config": {}
+    }
+
+    if widget_type == "trend":
+        axes_source = _require_list(config.get("axes", []), "Trend axes")
+        if not axes_source:
+            axes_source = [_default_axis()]
+        if len(axes_source) > MAX_AXES_PER_TREND:
+            raise DashboardError("A Trend Chart cannot have more than %s axes." % MAX_AXES_PER_TREND)
+        axis_ids = set()
+        axes = [_normalize_axis(axis, axis_ids) for axis in axes_source]
+        tags_source = _require_list(config.get("tags", []), "Trend tags")
+        if len(tags_source) > MAX_TAGS_BY_WIDGET["trend"]:
+            raise DashboardError("A Trend Chart cannot have more than %s pens." % MAX_TAGS_BY_WIDGET["trend"])
+        tags = [_normalize_tag(tag) for tag in tags_source]
+        for tag in tags:
+            if tag["path"] and tag["axis"] not in axis_ids:
+                tag["axis"] = axes[0]["id"]
+        style = _require_dict(config.get("style", {}), "Trend style")
+        normalized["config"] = {
+            "axes": axes,
+            "tags": tags,
+            "style": {
+                "showLegend": _as_bool(style.get("showLegend", True)),
+                "showGrid": _as_bool(style.get("showGrid", True)),
+                "background": _safe_text(style.get("background", "Default dark"), 40, "Trend background", True),
+                "interpolation": "Smooth" if _text(style.get("interpolation")) == "Smooth" else "Linear",
+                "referenceLineStyle": "Transparent" if _text(style.get("referenceLineStyle")) == "Transparent" else "Solid"
+            },
+            "timeScope": "Dashboard"
+        }
+    elif widget_type in ("table", "events"):
+        tags_source = _require_list(config.get("tags", []), "Widget tags")
+        limit = MAX_TAGS_BY_WIDGET[widget_type]
+        if len(tags_source) > limit:
+            raise DashboardError("%s cannot have more than %s tags." % (widget_type, limit))
+        normalized["config"] = {
+            "tags": [_normalize_tag(tag) for tag in tags_source],
+            "maxRows": max(1, min(100, _as_int(config.get("maxRows", 5), 5))),
+            "timeScope": "Dashboard"
+        }
+    else:
+        tag = _normalize_tag(config.get("tag", {}))
+        widget_config = {
+            "tag": tag,
+            "timeScope": "Dashboard"
+        }
+        if widget_type == "value":
+            widget_config.update({
+                "units": _safe_text(config.get("units", ""), 40, "Value units", True),
+                "precision": max(0, min(5, _as_int(config.get("precision", 1), 1))),
+                "showDelta": _as_bool(config.get("showDelta", False)),
+                "accent": _safe_text(config.get("accent", "#75b7ff"), 32, "Value accent", True)
+            })
+        elif widget_type == "status":
+            widget_config.update({
+                "onText": _safe_text(config.get("onText", "On"), 80, "On text", True),
+                "offText": _safe_text(config.get("offText", "Off"), 80, "Off text", True),
+                "trueColor": _safe_text(config.get("trueColor", "#4fd1a5"), 32, "True color", True),
+                "falseColor": _safe_text(config.get("falseColor", "#fb7185"), 32, "False color", True)
+            })
+        elif widget_type in ("timeline", "statebreakdown"):
+            widget_config["stateLabels"] = _to_plain(config.get("stateLabels", {}))
+        elif widget_type == "stat":
+            metric = _text(config.get("metric", "Average"))
+            if metric not in ALLOWED_STAT_METRICS:
+                raise DashboardError("Range Statistic metric is not supported.")
+            widget_config.update({
+                "metric": metric,
+                "stateValue": _as_int(config.get("stateValue", 0), 0),
+                "units": _safe_text(config.get("units", ""), 40, "Statistic units", True),
+                "precision": max(0, min(5, _as_int(config.get("precision", 1), 1))),
+                "accent": _safe_text(config.get("accent", "#75b7ff"), 32, "Statistic accent", True)
+            })
+        normalized["config"] = widget_config
+    return normalized
+
+def _widgets_overlap(a, b):
+    return a["x"] < b["x"] + b["w"] and a["x"] + a["w"] > b["x"] and a["y"] < b["y"] + b["h"] and a["y"] + a["h"] > b["y"]
+
+def _validate_dashboard_config(config, allow_empty_widgets=False):
+    config = _require_dict(config, "Dashboard config")
+    rows = _as_int(config.get("rows", GRID_ROWS), GRID_ROWS)
+    cols = _as_int(config.get("cols", GRID_COLUMNS), GRID_COLUMNS)
+    if rows != GRID_ROWS or cols != GRID_COLUMNS:
+        raise DashboardError("Dashboard grid must remain %s columns by %s rows." % (GRID_COLUMNS, GRID_ROWS))
+    widgets_source = _require_list(config.get("widgets", []), "Widgets")
+    if not widgets_source and not allow_empty_widgets:
+        raise DashboardError("A dashboard must contain at least one widget.")
+    if len(widgets_source) > MAX_WIDGETS_PER_DASHBOARD:
+        raise DashboardError("Dashboard exceeds the %s-widget limit." % MAX_WIDGETS_PER_DASHBOARD)
+
+    widgets = []
+    widget_ids = set()
+    for widget in widgets_source:
+        normalized = _normalize_widget(widget)
+        if normalized["id"] in widget_ids:
+            raise DashboardError("Widget ids must be unique.")
+        widget_ids.add(normalized["id"])
+        for existing in widgets:
+            if _widgets_overlap(normalized, existing):
+                raise DashboardError("Dashboard widgets may not overlap.")
+        widgets.append(normalized)
+
+    return {
+        "rows": GRID_ROWS,
+        "cols": GRID_COLUMNS,
+        "openingLiveRange": _validate_opening_range(config.get("openingLiveRange", {})),
+        "widgets": widgets
+    }
+
+def _config_json(config):
+    text = json.dumps(config, separators=(",", ":"), ensure_ascii=False)
+    if len(text.encode("utf-8")) > MAX_JSON_REQUEST_BYTES:
+        raise DashboardError("Dashboard configuration is too large.")
+    return text
+
+# ============================================================================
+# DASHBOARD CRUD
+# ============================================================================
+
+def _create_dashboard_row(identity, name, description, config):
+    if _dashboard_count(identity["username"]) >= MAX_DASHBOARDS_PER_OWNER:
+        raise DashboardError("Dashboard limit reached (%s per owner)." % MAX_DASHBOARDS_PER_OWNER)
+    config = _validate_dashboard_config(config)
+    dashboard_id = str(UUID.randomUUID())
+    name = _unique_dashboard_name(identity["username"], name)
+    description = _safe_text(description, MAX_DASHBOARD_DESCRIPTION_LENGTH, "Dashboard description", True)
+    _run_update(
+        """
+        INSERT INTO %s
+        (
+            DashboardId, OwnerUsername, OwnerDisplayName, DashboardName,
+            DashboardDescription, IsShared, ConfigSchemaVersion, ConfigJson,
+            CreatedAt, UpdatedAt
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME())
+        """ % _qualified_table(),
+        [
+            dashboard_id, identity["username"], identity["displayName"], name,
+            description, False, CONFIG_SCHEMA_VERSION, _config_json(config)
+        ]
+    )
+    return _fetch_owned_dashboard(dashboard_id, identity["username"])
+def _create_default_dashboard(identity):
+    return _create_dashboard_row(
+        identity,
+        "Untitled Dashboard",
+        "New dashboard",
+        _default_dashboard_config()
+    )
+
+def _list_owned_dashboards(identity):
+    rows = _query_rows(
+        _dashboard_select_sql("WHERE OwnerUsername = ? ORDER BY UpdatedAt DESC, DashboardName ASC"),
+        [identity["username"]]
+    )
+    return [_decode_dashboard_row(row) for row in rows]
+
+def _get_dashboard_for_view(identity, dashboard_id):
+    dashboard = _fetch_dashboard_by_id(dashboard_id)
+    if dashboard is None:
+        raise DashboardError("Dashboard was not found.")
+    if dashboard["ownerUsername"] != identity["username"] and not dashboard["isShared"]:
+        raise DashboardError("You do not have access to this dashboard.")
+    return dashboard
+
+def _save_dashboard(identity, payload):
+    payload = _require_dict(payload, "Save payload")
+    dashboard_id = _safe_text(payload.get("id"), 80, "Dashboard id", False)
+    existing = _fetch_owned_dashboard(dashboard_id, identity["username"])
+    if existing is None:
+        raise DashboardError("Only the dashboard owner can save this dashboard.")
+
+    expected_row_version = _safe_text(payload.get("rowVersion"), 34, "Row version", False)
+    config = _validate_dashboard_config(payload.get("config", {}))
+    name = _safe_text(payload.get("name"), MAX_DASHBOARD_NAME_LENGTH, "Dashboard name", False)
+    description = _safe_text(payload.get("description", ""), MAX_DASHBOARD_DESCRIPTION_LENGTH, "Dashboard description", True)
+    is_shared = _as_bool(payload.get("isShared", False))
+
+    # A name remains unique per owner. Permit the current row to keep its name.
+    conflicting = _query_one(
+        "SELECT DashboardId FROM %s WHERE OwnerUsername = ? AND DashboardName = ? AND DashboardId <> ?" % _qualified_table(),
+        [identity["username"], name, dashboard_id]
+    )
+    if conflicting:
+        raise DashboardError("You already have a dashboard with that name.")
+
+    updated = _run_update(
+        """
+        UPDATE %s
+        SET
+            OwnerDisplayName = ?,
+            DashboardName = ?,
+            DashboardDescription = ?,
+            IsShared = ?,
+            ConfigSchemaVersion = ?,
+            ConfigJson = ?,
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE DashboardId = ?
+          AND OwnerUsername = ?
+          AND RowVersion = CONVERT(varbinary(8), ?, 1)
+        """ % _qualified_table(),
+        [
+            identity["displayName"], name, description, is_shared,
+            CONFIG_SCHEMA_VERSION, _config_json(config),
+            dashboard_id, identity["username"], expected_row_version
+        ]
+    )
+    if updated != 1:
+        raise DashboardError("Dashboard changed on the server. Reload it before saving again.")
+    return _fetch_owned_dashboard(dashboard_id, identity["username"])
+
+def _delete_dashboard(identity, payload):
+    payload = _require_dict(payload, "Delete payload")
+    dashboard_id = _safe_text(payload.get("id"), 80, "Dashboard id", False)
+    row_version = _safe_text(payload.get("rowVersion"), 34, "Row version", False)
+    deleted = _run_update(
+        """
+        DELETE FROM %s
+        WHERE DashboardId = ?
+          AND OwnerUsername = ?
+          AND RowVersion = CONVERT(varbinary(8), ?, 1)
+        """ % _qualified_table(),
+        [dashboard_id, identity["username"], row_version]
+    )
+    if deleted != 1:
+        raise DashboardError("Dashboard could not be deleted because it changed on the server.")
+
+def _copy_dashboard(identity, payload):
+    payload = _require_dict(payload, "Copy payload")
+    source_id = _safe_text(payload.get("id"), 80, "Dashboard id", False)
+    source = _get_dashboard_for_view(identity, source_id)
+    config = {
+        "rows": source["rows"],
+        "cols": source["cols"],
+        "openingLiveRange": source["openingLiveRange"],
+        "widgets": source["widgets"]
+    }
+    return _create_dashboard_row(
+        identity,
+        source["name"] + " (Copy)",
+        source["description"],
+        config
+    )
+
+def _shared_dashboard_summaries(identity):
+    rows = _query_rows(
+        """
+        SELECT
+            DashboardId,
+            OwnerUsername,
+            OwnerDisplayName,
+            DashboardName,
+            DashboardDescription,
+            ConfigJson,
+            UpdatedAt
+        FROM %s
+        WHERE IsShared = 1
+          AND OwnerUsername <> ?
+        ORDER BY UpdatedAt DESC, DashboardName ASC
+        """ % _qualified_table(),
+        [identity["username"]]
+    )
+    output = []
+    for row in rows:
+        try:
+            widget_count = len(json.loads(_text(_row_value(row, "ConfigJson", "{}"))).get("widgets", []))
+        except:
+            widget_count = 0
+        output.append({
+            "id": _text(_row_value(row, "DashboardId")),
+            "ownerUsername": _text(_row_value(row, "OwnerUsername")),
+            "ownerDisplayName": _text(_row_value(row, "OwnerDisplayName")),
+            "name": _text(_row_value(row, "DashboardName")),
+            "description": _text(_row_value(row, "DashboardDescription")),
+            "widgetCount": widget_count
+        })
+    return output
+
+# ============================================================================
+# TAG PATH SAFETY AND BROWSING
+# ============================================================================
+
+def _root_payloads():
+    output = []
+    for item in ALLOWED_TAG_ROOTS:
+        output.append({
+            "provider": _text(item.get("provider", "")),
+            "root": _text(item.get("root", "")),
+            "label": _text(item.get("label", item.get("root", "")))
+        })
+    return output
+
+def _is_history_enabled(path):
+    if not REQUIRE_HISTORY_ENABLED_TAGS:
+        return True
+    try:
+        configs = system.tag.getConfiguration(path, False)
+        if not configs:
+            return False
+        config = configs[0]
+        return _as_bool(config.get("historyEnabled", False))
+    except:
+        return False
+
+def _node_value(node, name, default=None):
+    try:
+        return node[name]
+    except:
+        try:
+            return node.get(name, default)
+        except:
+            return default
+
+def _browse_tags(payload):
+    payload = _require_dict(payload, "Browse payload")
+    requested_path = _safe_text(payload.get("path", ""), 1024, "Browse path", True)
+
+    if not requested_path:
+        return {
+            "nodes": [{
+                "kind": "folder",
+                "path": item["root"],
+                "name": item["label"],
+                "dataType": ""
+            } for item in _root_payloads()]
+        }
+
+    path = _validate_tag_path(requested_path, False)
+    results = system.tag.browse(path, {"maxResults": TAG_BROWSER_MAX_RESULTS})
+    nodes = []
+    for node in results:
+        full_path = _text(_node_value(node, "fullPath", ""))
+        name = _text(_node_value(node, "name", full_path))
+        tag_type = _text(_node_value(node, "tagType", ""))
+        data_type = _text(_node_value(node, "dataType", ""))
+        if not full_path or not _is_allowed_path_quiet(full_path):
+            continue
+        kind = "folder" if "Folder" in tag_type or "UdtInstance" in tag_type else "tag"
+        if kind == "tag" and not _is_history_enabled(full_path):
+            continue
+        nodes.append({
+            "kind": kind,
+            "path": full_path,
+            "name": name,
+            "dataType": data_type
+        })
+    return {"nodes": nodes}
+
+def _is_allowed_path_quiet(path):
+    try:
+        _validate_tag_path(path, False)
+        return True
+    except:
+        return False
+
+# ============================================================================
+# READ-ONLY CURRENT / HISTORIAN DATA
+# ============================================================================
+
+def _to_numeric_or_boolean(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    try:
+        return float(value)
+    except:
+        try:
+            return 1 if _as_bool(value) else 0
+        except:
+            return None
+
+def _validate_epoch_range(start_ms, end_ms):
+    start_ms = long(start_ms)
+    end_ms = long(end_ms)
+    if end_ms <= start_ms:
+        raise DashboardError("End time must be later than start time.")
+    if end_ms - start_ms > MAX_QUERY_DURATION_MS:
+        raise DashboardError("A historian query cannot exceed %s months." % MAX_QUERY_MONTHS)
+    return start_ms, end_ms
+
+def _validate_request_series(value):
+    series = _require_list(value, "History series")
+    if len(series) > MAX_HISTORY_SERIES_PER_REQUEST:
+        raise DashboardError("Too many historian series were requested.")
+    seen = set()
+    output = []
+    for item in series:
+        item = _require_dict(item, "History series item")
+        path = _validate_tag_path(item.get("path"), False)
+        aggregate = _text(item.get("aggregate", "Raw stored values"))
+        if aggregate not in ALLOWED_AGGREGATES:
+            raise DashboardError("Unsupported historian retrieval mode.")
+        key = _safe_text(item.get("key"), 1200, "History series key", False)
